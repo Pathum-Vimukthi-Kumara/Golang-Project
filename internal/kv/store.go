@@ -35,22 +35,35 @@ func (s *Store) Get(key string) string {
 	if v, ok := s.lru.get(key); ok {
 		return v
 	}
-	return ""
+	var val string
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("kv"))
+		if b != nil {
+			v := b.Get([]byte(key))
+			if v != nil {
+				val = string(v)
+			}
+		}
+		return nil
+	})
+	if val != "" {
+		s.lru.add(key, val)
+	}
+	return val
 }
 
 func (s *Store) Apply(cmd any) any {
 	switch c := cmd.(type) {
-
 	case SetCmd:
 		_ = s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket([]byte("kv")).Put([]byte(c.Key), []byte(c.Value))
 		})
-
+		s.lru.add(c.Key, c.Value)
 	case DelCmd:
 		_ = s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket([]byte("kv")).Delete([]byte(c.Key))
 		})
-
+		s.lru.remove(c.Key)
 	case GetCmd:
 		return s.Get(c.Key)
 	}
@@ -87,14 +100,17 @@ func (c *lruCache) add(k, v string) {
 
 	if e, ok := c.tab[k]; ok {
 		e.Value.(*entry).value = v
+		c.ll.MoveToFront(e)
 		return
 	}
-	e := c.ll.PushBack(&entry{k, v})
+	e := c.ll.PushFront(&entry{k, v})
 	c.tab[k] = e
-	if c.ll.Len() >= c.cap {
+	if c.ll.Len() > c.cap {
 		tail := c.ll.Back()
-		c.ll.Remove(tail)
-		delete(c.tab, tail.Value.(*entry).key)
+		if tail != nil {
+			c.ll.Remove(tail)
+			delete(c.tab, tail.Value.(*entry).key)
+		}
 	}
 }
 

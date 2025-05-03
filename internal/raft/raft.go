@@ -335,18 +335,24 @@ func (n *Node) handleAppendEntriesReply(peerID string, reply *AppendEntriesReply
 		return
 	}
 	if !reply.Success {
-		if n.nextIndex[peerID] > 1 {
+		if n.nextIndex[peerID] > n.log.FirstIndex() {
 			n.nextIndex[peerID]--
 		}
 		return
 	}
 
 	// --- success path --------------------------------------------------
+	// update nextIndex and matchIndex for follower
 	n.nextIndex[peerID] = n.log.LastIndex() + 1
 	n.matchIndex[peerID] = n.log.LastIndex()
 
+	// Only advance commitIndex for entries in current term (Raft safety)
 	advanced := false
 	for i := n.commitIndex + 1; i <= n.log.LastIndex(); i++ {
+		entry, ok := n.log.At(i)
+		if !ok || entry.Term != n.currentTerm {
+			continue
+		}
 		replicated := 1 // self
 		for id := range n.peers {
 			if id != n.id && n.matchIndex[id] >= i {
@@ -433,12 +439,8 @@ func (n *Node) onAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
 	if args.LeaderCommit > n.commitIndex {
 		n.commitIndex = min_(args.LeaderCommit, n.log.LastIndex())
 	}
-	for n.lastApplied < n.commitIndex {
-		n.lastApplied++
-		if _, ok := n.log.At(n.lastApplied); ok {
-			n.store.SetLastApplied(n.lastApplied)
-		}
-	}
+	// Always apply all committed entries (fix follower catch-up)
+	n.applyCommitted()
 	n.maybePrune()
 
 	return AppendEntriesReply{Term: n.currentTerm, Success: true}
