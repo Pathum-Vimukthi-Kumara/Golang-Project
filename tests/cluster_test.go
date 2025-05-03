@@ -47,6 +47,7 @@ func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 
 	nodes := make([]*raft.Node, 0, n)
 	dbs := make([]*bolt.DB, 0, n)
+	applyChans := make([]chan raft.ApplyMsg, 0, n)
 
 	for id, addr := range addrs {
 		// peer map ----------------------------------------------------
@@ -67,20 +68,23 @@ func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 
 		// raft node ---------------------------------------------------
 		applyCh := make(chan raft.ApplyMsg, 128)
+		applyChans = append(applyChans, applyCh)
 		node := raft.NewNode(id, peers, applyCh, db)
 
 		// drain applyCh so it never blocks ---------------------------
 		go func(ch <-chan raft.ApplyMsg) {
-			for range ch { /* discard */
-			}
+			for range ch { /* discard */ }
 		}(applyCh)
 
 		// start HTTP listener ----------------------------------------
+		// FIX: use correct node reference in closure
 		go func(n *raft.Node, addr string) {
 			n.Start()
 			mux := http.NewServeMux()
-			mux.Handle("/raft/", http.StripPrefix("/raft", node.Trans()))
-			log.Fatal(http.ListenAndServe(addr, mux))
+			mux.Handle("/raft/", http.StripPrefix("/raft", n.Trans()))
+			if err := http.ListenAndServe(addr, mux); err != nil {
+				log.Printf("[WARN] HTTP server on %s exited: %v", addr, err)
+			}
 		}(node, addr)
 
 		nodes = append(nodes, node)
@@ -94,12 +98,31 @@ func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 			}
 			n.Stop()
 		}
+		for _, ch := range applyChans {
+			close(ch) // ensure applyCh is closed to avoid goroutine leaks
+		}
 		for _, db := range dbs {
 			db.Close()
 		}
 	}
 
 	return nodes, stop
+}
+
+// waitForLeader waits for a leader to be elected in the given nodes within a timeout.
+func waitForLeader(t *testing.T, nodes []*raft.Node, timeout time.Duration) *raft.Node {
+	deadline := time.Now().Add(timeout)
+	for {
+		for _, n := range nodes {
+			if n.State() == raft.Leader {
+				return n
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no leader elected after %v", timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // --------------------------------------------------
@@ -109,17 +132,7 @@ func TestEndToEndReplication(t *testing.T) {
 	nodes, stop := buildCluster(t, 5)
 	defer stop()
 
-	time.Sleep(4 * time.Second) // allow election
-	var leader *raft.Node
-	for _, n := range nodes {
-		if n.State() == raft.Leader {
-			leader = n
-			break
-		}
-	}
-	if leader == nil {
-		t.Fatalf("no leader elected")
-	}
+	leader := waitForLeader(t, nodes, 5*time.Second)
 
 	idx, ok := leader.Propose(kv.SetCmd{Key: "foo", Value: "bar"})
 	if !ok {
@@ -149,18 +162,8 @@ func TestEndToEndReplication(t *testing.T) {
 func TestConcurrentWrites(t *testing.T) {
 	nodes, stop := buildCluster(t, 1)
 	defer stop()
-	time.Sleep(2 * time.Second)
 
-	var leader *raft.Node
-	for _, n := range nodes {
-		if n.State() == raft.Leader {
-			leader = n
-			break
-		}
-	}
-	if leader == nil {
-		t.Fatalf("no leader elected")
-	}
+	leader := waitForLeader(t, nodes, 3*time.Second)
 
 	entry_count := 1000
 
